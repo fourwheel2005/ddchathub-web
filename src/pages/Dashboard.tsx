@@ -3,7 +3,7 @@ import api from '../lib/api';
 import { 
     Users, User, Phone, Plus, Settings, X, 
     Tag as TagIcon, MessageCircle, 
-    ChevronDown, LogOut // 💡 เพิ่ม 2 ตัวนี้
+    ChevronDown, LogOut,Store // 💡 เพิ่ม 2 ตัวนี้
   } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { jwtDecode } from 'jwt-decode';
@@ -21,15 +21,26 @@ interface JwtPayload {
     exp: number;
   }
 
-interface Customer {
-  id: string;
-  lineUserId: string;
-  fullName: string;            
-  profilePictureUrl: string;   
-  realName: string | null;
-  phoneNumber: string | null;
-  tags: Tag[];
-}
+  interface Customer {
+    id: string;
+    lineUserId: string;
+    fullName: string;            
+    profilePictureUrl: string;   
+    realName: string | null;
+    phoneNumber: string | null;
+    tags: Tag[];
+    channelName: string;
+    channelColor: string;
+    channelId: string;
+  }
+
+interface LineChannel {
+    id: string;
+    channelName: string;
+    channelAccessToken: string;
+    channelSecret: string;
+    colorCode: string;
+  }
 
 export default function Dashboard() {
   const [customers, setCustomers] = useState<Customer[]>([]);
@@ -43,9 +54,36 @@ export default function Dashboard() {
   const [selectedCustomer, setSelectedCustomer] = useState<Customer | null>(null);
 
   const [isProfileDropdownOpen, setIsProfileDropdownOpen] = useState(false);
-  
 
+  const [isChannelModalOpen, setIsChannelModalOpen] = useState(false);
+  const [allChannels, setAllChannels] = useState<LineChannel[]>([]);
+  const [selectedChannelId, setSelectedChannelId] = useState<string>('');
+  const [newChannelForm, setNewChannelForm] = useState({ name: '', token: '', secret: '', color: '#10B981' });
   
+  const [selectedChannelFilter, setSelectedChannelFilter] = useState<string>('');
+
+  const filteredCustomers = React.useMemo(() => {
+    return customers.filter(customer => {
+      // แปลงเป็น String ทั้งคู่เพื่อป้องกันบั๊ก Type ไม่ตรงกัน
+      return selectedChannelFilter === '' || String(customer.channelId) === String(selectedChannelFilter);
+    });
+  }, [customers, selectedChannelFilter]);
+
+  const fetchCustomers = async (channelId: string = '') => {
+    try {
+      setIsLoading(true);
+      const res = await api.get(`/customers?channelId=${channelId}`);
+      setCustomers(res.data);
+    } catch (error) {
+      console.error('Error fetching customers', error);
+    } finally {
+      setIsLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    fetchCustomers(selectedChannelId); 
+  }, [selectedChannelId]);
 
   const fetchData = async () => {
     try {
@@ -97,6 +135,40 @@ export default function Dashboard() {
     // เรียกดึงข้อมูลลูกค้าตามปกติ
     fetchData(); 
   }, []);
+
+  const fetchChannels = async () => {
+    try {
+      const res = await api.get('/channels');
+      setAllChannels(res.data);
+    } catch (error) {
+      console.error('Error fetching channels', error);
+    }
+  };
+
+  const handleCreateChannel = async (e: React.FormEvent) => {
+    e.preventDefault();
+    if (!newChannelForm.name || !newChannelForm.token || !newChannelForm.secret) return;
+
+    try {
+      await api.post('/channels', {
+        channelName: newChannelForm.name,
+        channelAccessToken: newChannelForm.token,
+        channelSecret: newChannelForm.secret,
+        colorCode: newChannelForm.color
+      });
+      
+      // ล้างค่าในฟอร์ม
+      setNewChannelForm({ name: '', token: '', secret: '', color: '#10B981' });
+      
+      fetchChannels(); 
+      alert('เพิ่มสาขาใหม่เรียบร้อยแล้ว!');
+    } catch (error) {
+      console.error('Error creating channel:', error);
+      alert('เกิดข้อผิดพลาดในการสร้างสาขา');
+    }
+  };
+
+ 
 
   const handleCreateSystemTag = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -172,6 +244,16 @@ export default function Dashboard() {
           >
             <Settings size={18} /> จัดการแท็ก
           </button>
+          {/* 💡 แทรก ข้อ 3 ตรงนี้ครับ! (โชว์เฉพาะ Super Admin) */}
+          {currentUser.role === 'Super Admin' && (
+            <button 
+              onClick={() => { setIsChannelModalOpen(true); fetchChannels(); }}
+              className="px-4 py-2 bg-purple-50 text-purple-600 rounded-lg hover:bg-purple-100 flex items-center gap-2 font-medium transition-colors border border-purple-200"
+            >
+              <Store size={18} /> จัดการ LINE OA
+            </button>
+          )}
+          {/* ----------------------------------------- */}
           
           {/* ----------------- User Profile Dropdown ----------------- */}
           <div className="relative ml-2">
@@ -222,9 +304,41 @@ export default function Dashboard() {
 
         </div>
       </div>
+    
 
-      {/* ตารางข้อมูล */}
-      <div className="max-w-6xl mx-auto bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden">
+{/* ---------------- แถบกรองสาขา ---------------- */}
+<div className="max-w-6xl mx-auto bg-white p-4 rounded-t-xl border border-gray-200 shadow-sm flex justify-between items-center mb-0">
+        <div className="flex items-center gap-3">
+          {/* 💡 แอบเพิ่ม (วงเล็บจำนวนสาขา) ไว้เช็กว่าข้อมูลมาถึงตรงนี้จริงๆ ไหม */}
+          <label className="text-sm font-medium text-gray-700">กรองตามสาขา ({allChannels.length}):</label>
+          <div className="relative">
+            <select
+              value={selectedChannelId}
+              onChange={(e) => setSelectedChannelId(e.target.value)}
+              className="appearance-none pl-10 pr-8 py-2 bg-gray-50 border border-gray-300 rounded-full text-sm focus:outline-none focus:ring-2 focus:ring-blue-500 cursor-pointer text-gray-800"
+            >
+              <option value="">📱 ดูทุกสาขา (All Channels)</option>
+              
+              {/* 🎯 จุดสำคัญ: ต้องใช้ ch.channelName ให้ตรงกับที่ Modal ใช้ครับ */}
+              {allChannels.map(ch => (
+                <option key={ch.id} value={ch.id}>
+                  {ch.channelName}
+                </option>
+              ))}
+
+            </select>
+            <Store className="absolute left-3 top-2.5 text-gray-400" size={16} />
+            <ChevronDown className="absolute right-3 top-3 text-gray-400 pointer-events-none" size={14} />
+          </div>
+        </div>
+        <div className="text-sm text-gray-500 font-medium">
+          แสดงข้อมูล {customers.length} รายการ
+        </div>
+      </div>
+      
+      {/* ... โค้ดตาราง <table ...> เดิม ... */}
+     {/* ตารางข้อมูล */}
+     <div className="max-w-6xl mx-auto bg-white rounded-xl shadow-sm border border-gray-200 overflow-hidden mb-8">
         {isLoading ? (
           <div className="p-8 text-center text-gray-500">กำลังโหลดข้อมูล...</div>
         ) : (
@@ -239,9 +353,8 @@ export default function Dashboard() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-gray-100">
-                {  customers.map((customer) => {
-                  
-                  // 💡 ท่าไม้ตาย! ดักจับชื่อตัวแปรทั้งแบบ React และแบบที่อาจจะหลุดมาจาก Database
+                {/* 💡 จุดที่เปลี่ยน: ใช้ filteredCustomers.map แทน customers.map */}
+                {filteredCustomers.map((customer) => {
                   const picUrl = customer.profilePictureUrl || (customer as any).profile_picture_url;
 
                   return (
@@ -250,49 +363,67 @@ export default function Dashboard() {
                         <div className="flex items-center gap-3">
                           <div className="w-10 h-10 rounded-full bg-gray-200 flex items-center justify-center shrink-0 overflow-hidden border border-gray-200">
                             {picUrl ? (
-                              <img 
-                                src={picUrl} 
-                                alt={customer.fullName} 
-                                className="w-full h-full object-cover"
-                                referrerPolicy="no-referrer" 
-                              />
+                              <img src={picUrl} alt={customer.fullName} className="w-full h-full object-cover" referrerPolicy="no-referrer" />
                             ) : (
                               <User className="text-gray-500" size={20} />
                             )}
                           </div>
-                          <span className="font-medium text-gray-900">{customer.fullName}</span>
+                          
+                          {/* 💡 จุดที่เปลี่ยน: เพิ่มป้าย Badge สาขาใต้ชื่อลูกค้า */}
+                          <div className="flex flex-col items-start gap-1">
+                            <span className="font-medium text-gray-900 leading-none mt-1">{customer.fullName}</span>
+                            <span 
+                              className="text-[10px] px-1.5 py-0.5 rounded-md flex items-center gap-1 border"
+                              style={{ 
+                                backgroundColor: customer.channelColor ? `${customer.channelColor}15` : '#f3f4f6', 
+                                color: customer.channelColor || '#4b5563', 
+                                borderColor: customer.channelColor ? `${customer.channelColor}30` : '#e5e7eb' 
+                              }}
+                            >
+                              <Store size={10} /> {customer.channelName || 'LINE OA'}
+                            </span>
+                          </div>
+
                         </div>
                       </td>
 
-                    <td className="px-6 py-4 text-gray-600">{customer.realName || '-'}</td>
-                    <td className="px-6 py-4 text-gray-600">
-                      {customer.phoneNumber ? (
-                        <span className="flex items-center gap-1"><Phone size={14} /> {customer.phoneNumber}</span>
-                      ) : '-'}
-                    </td>
-                    <td className="px-6 py-4">
-                      <div className="flex flex-wrap items-center gap-2">
-                        {customer.tags.map(tag => (
-                          <span 
-                            key={tag.id} 
-                            className="px-2 py-1 text-xs rounded-md font-medium"
-                            style={{ backgroundColor: `${tag.color}20`, color: tag.color, border: `1px solid ${tag.color}40` }}
+                      <td className="px-6 py-4 text-gray-600">{customer.realName || '-'}</td>
+                      <td className="px-6 py-4 text-gray-600">
+                        {customer.phoneNumber ? (
+                          <span className="flex items-center gap-1"><Phone size={14} /> {customer.phoneNumber}</span>
+                        ) : '-'}
+                      </td>
+                      <td className="px-6 py-4">
+                        <div className="flex flex-wrap items-center gap-2">
+                          {customer.tags.map(tag => (
+                            <span 
+                              key={tag.id} 
+                              className="px-2 py-1 text-xs rounded-md font-medium"
+                              style={{ backgroundColor: `${tag.color}20`, color: tag.color, border: `1px solid ${tag.color}40` }}
+                            >
+                              {tag.name}
+                            </span>
+                          ))}
+                          <button 
+                            onClick={() => setSelectedCustomer(customer)}
+                            className="w-6 h-6 rounded-full border border-dashed border-gray-400 flex items-center justify-center text-gray-400 hover:border-blue-500 hover:text-blue-500 transition-colors"
+                            title="เพิ่มป้ายกำกับ"
                           >
-                            {tag.name}
-                          </span>
-                        ))}
-                        <button 
-                          onClick={() => setSelectedCustomer(customer)}
-                          className="w-6 h-6 rounded-full border border-dashed border-gray-400 flex items-center justify-center text-gray-400 hover:border-blue-500 hover:text-blue-500 transition-colors"
-                          title="เพิ่มป้ายกำกับ"
-                        >
-                          <Plus size={14} />
-                        </button>
-                      </div>
-                    </td>
+                            <Plus size={14} />
+                          </button>
+                        </div>
+                      </td>
                     </tr>
-                ); // ✅ 1. ต้องปิดวงเล็บของ return ก่อน
-              })}  {/* ✅ 2. แล้วค่อยปิดปีกกาและวงเล็บของ map */}
+                  );
+                })}
+                {/* ดักกรณีค้นหาแล้วไม่เจอใครเลย */}
+                {filteredCustomers.length === 0 && (
+                  <tr>
+                    <td colSpan={4} className="px-6 py-8 text-center text-gray-400">
+                      ไม่พบข้อมูลลูกค้าในสาขานี้
+                    </td>
+                  </tr>
+                )}
               </tbody>
             </table>
           </div>
@@ -390,7 +521,101 @@ export default function Dashboard() {
           </div>
         </div>
       )}
+      {/* 💡 แทรก ข้อ 4 ตรงนี้ครับ! (ใต้ Modal 2 และอยู่ก่อนปิด div สุดท้าย) */}
+      {/* ----------------- MODAL 3: จัดการ LINE OA ----------------- */}
+      {isChannelModalOpen && (
+        <div className="fixed inset-0 bg-black/50 flex items-center justify-center z-50">
+          <div className="bg-white rounded-xl shadow-xl w-full max-w-3xl p-6">
+            <div className="flex justify-between items-center mb-6">
+              <h2 className="text-xl font-bold flex items-center gap-2 text-purple-700">
+                <Store size={24} /> จัดการช่องทาง LINE OA
+              </h2>
+              <button onClick={() => setIsChannelModalOpen(false)} className="text-gray-400 hover:text-gray-600"><X size={20} /></button>
+            </div>
 
-    </div>
+            <div className="bg-purple-50 p-4 rounded-lg mb-4 text-sm text-purple-800 border border-purple-100">
+              💡 <b>Webhook URL ของคุณคือ:</b> นำ URL นี้ไปใส่ใน LINE Developers 
+              (อย่าลืมเติม ID สาขาต่อท้าย เช่น <code className="bg-white px-1 py-0.5 rounded text-black">https://your-domain.com/api/v1/webhook/<b>IDสาขา</b></code>)
+            </div>
+
+            {/* 💡 สิ่งที่เพิ่มเข้ามา: ฟอร์มสร้างสาขาใหม่ */}
+            <form onSubmit={handleCreateChannel} className="mb-6 p-4 border border-gray-200 rounded-lg bg-gray-50 flex flex-col gap-3">
+              <h3 className="font-semibold text-gray-700">➕ เพิ่มสาขาใหม่</h3>
+              <div className="flex gap-3">
+                <input 
+                  type="text" required placeholder="ชื่อสาขา (เช่น แจ้งวัฒนะ)" 
+                  value={newChannelForm.name} onChange={e => setNewChannelForm({...newChannelForm, name: e.target.value})}
+                  className="flex-1 px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-1 focus:ring-purple-500"
+                />
+                <input 
+                  type="color" value={newChannelForm.color} onChange={e => setNewChannelForm({...newChannelForm, color: e.target.value})}
+                  className="w-10 h-10 p-0.5 border border-gray-300 rounded cursor-pointer" title="เลือกสีประจำสาขา"
+                />
+              </div>
+              <input 
+                type="text" required placeholder="Channel Access Token (ยาวๆ)" 
+                value={newChannelForm.token} onChange={e => setNewChannelForm({...newChannelForm, token: e.target.value})}
+                className="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-1 focus:ring-purple-500"
+              />
+              <input 
+                type="text" required placeholder="Channel Secret" 
+                value={newChannelForm.secret} onChange={e => setNewChannelForm({...newChannelForm, secret: e.target.value})}
+                className="w-full px-3 py-2 border border-gray-300 rounded text-sm focus:outline-none focus:ring-1 focus:ring-purple-500"
+              />
+              <button type="submit" className="bg-purple-600 hover:bg-purple-700 text-white font-medium py-2 rounded transition-colors text-sm">
+                บันทึกสาขาใหม่
+              </button>
+            </form>
+
+      
+
+            <div className="max-h-80 overflow-y-auto border border-gray-200 rounded-lg">
+              <table className="w-full text-left text-sm">
+                <thead className="bg-gray-50 border-b border-gray-200">
+                  <tr>
+                    <th className="px-4 py-3 font-semibold text-gray-600">ชื่อสาขา</th>
+                    <th className="px-4 py-3 font-semibold text-gray-600">รหัสสี</th>
+                    <th className="px-4 py-3 font-semibold text-gray-600">ID สาขา (สำหรับ Webhook)</th>
+                    <th className="px-4 py-3 text-right font-semibold text-gray-600">จัดการ</th>
+                  </tr>
+                </thead>
+                <tbody className="divide-y divide-gray-100">
+                  {allChannels.map(ch => (
+                    <tr key={ch.id} className="hover:bg-gray-50">
+                      <td className="px-4 py-3 font-medium flex items-center gap-2">
+                        <div className="w-3 h-3 rounded-full" style={{ backgroundColor: ch.colorCode }}></div>
+                        {ch.channelName}
+                      </td>
+                      <td className="px-4 py-3 text-gray-500 font-mono">{ch.colorCode}</td>
+                      <td className="px-4 py-3 text-gray-500 font-mono text-xs">{ch.id}</td>
+                      <td className="px-4 py-3 text-right">
+                        <button className="text-blue-500 hover:text-blue-700">แก้ไข</button>
+                      </td>
+                    </tr>
+                  ))}
+                  {allChannels.length === 0 && (
+                    <tr><td colSpan={4} className="px-4 py-8 text-center text-gray-400">ยังไม่มีข้อมูลช่องทาง LINE OA</td></tr>
+                  )}
+                </tbody>
+              </table>
+            </div>
+
+            <button 
+              onClick={() => setIsChannelModalOpen(false)}
+              className="mt-6 w-full bg-gray-100 text-gray-700 py-2 rounded-lg font-medium hover:bg-gray-200 transition-colors"
+            >
+              ปิดหน้าต่าง
+            </button>
+          </div>
+        </div>
+      )}
+      {/* ----------------------------------------------------------- */}
+
+    </div> // ⚠️ นี่คือ </div> บรรทัดสุดท้า
+
+    
   );
+
+  
+  
 }
