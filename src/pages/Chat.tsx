@@ -1,9 +1,11 @@
 import React, { useState, useEffect, useRef, useMemo } from 'react';
-import { Send, User, Search, Store, ArrowLeft, Loader2, MessageSquare, Filter, CheckCircle2 } from 'lucide-react';
+import { Send, User, Search, Store, ArrowLeft, Loader2, MessageSquare, Filter, CheckCircle2, Eye } from 'lucide-react';
 import { Link } from 'react-router-dom';
 import { Client } from '@stomp/stompjs';
 import SockJS from 'sockjs-client';
 import api from '../lib/api';
+// 💡 1. Import jwtDecode สำหรับดึงชื่อแอดมิน
+import { jwtDecode } from 'jwt-decode';
 
 // --- Types ---
 interface Tag {
@@ -28,6 +30,7 @@ interface Chat {
   channelId: string;
   channelColor: string;
   tags: Tag[];
+  assignee?: string | null;
 }
 
 interface Message {
@@ -35,6 +38,13 @@ interface Message {
   content: string;
   senderType: 'CUSTOMER' | 'AGENT' | 'ADMIN';
   createdAt: string;
+  senderName?: string;
+}
+
+// 💡 2. Type สำหรับแอดมินที่กำลังดูแชท
+interface ViewingAdmin {
+  customerId: string;
+  adminName: string;
 }
 
 const formatTime = (isoString: string) => {
@@ -49,14 +59,16 @@ export default function Chat() {
   const [messages, setMessages] = useState<Message[]>([]);
   const [messageInput, setMessageInput] = useState('');
   
-  // State สำหรับ Filters
   const [searchKeyword, setSearchKeyword] = useState('');
   const [selectedTagId, setSelectedTagId] = useState<string>('');
   const [selectedChannelId, setSelectedChannelId] = useState<string>(''); 
   
-  // State เก็บ Master Data
   const [allTags, setAllTags] = useState<Tag[]>([]);
   const [allChannels, setAllChannels] = useState<LineChannel[]>([]); 
+
+  // 💡 3. State จัดการ Presence (ป้องกันตอบชน)
+  const [currentAdminName, setCurrentAdminName] = useState('Admin');
+  const [viewingAdmins, setViewingAdmins] = useState<ViewingAdmin[]>([]);
 
   const [isLoading, setIsLoading] = useState(false);
   const [isSending, setIsSending] = useState(false);
@@ -64,8 +76,21 @@ export default function Chat() {
 
   const bottomRef = useRef<HTMLDivElement>(null);
   const activeChatIdRef = useRef<string | undefined>(undefined);
+  // 💡 เก็บ Instance WebSocket ไว้เพื่อใช้ประกาศสถานะ
+  const stompClientRef = useRef<Client | null>(null);
 
-  // --- 1. โหลดข้อมูลเริ่มต้น ---
+  // --- โหลดข้อมูลเริ่มต้น & ดึงชื่อแอดมิน ---
+  useEffect(() => {
+    const token = localStorage.getItem('token');
+    if (token) {
+      try {
+        const decoded = jwtDecode<{sub: string}>(token);
+        setCurrentAdminName(decoded.sub);
+      } catch (err) {}
+    }
+    fetchInitialData();
+  }, []);
+
   const fetchInitialData = async () => {
     try {
       const [chatRes, tagsRes, channelsRes] = await Promise.all([
@@ -77,6 +102,7 @@ export default function Chat() {
       const formattedChats = chatRes.data.map((chat: any) => ({
         ...chat,
         tags: chat.tags || [],
+        assignee: chat.assignee || null,
         time: chat.time ? new Date(chat.time).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }) : ''
       }));
       
@@ -89,50 +115,92 @@ export default function Chat() {
     }
   };
 
-  useEffect(() => {
-    fetchInitialData();
-  }, []);
-
+  // 💡 4. จัดการ Unread และ Presence เมื่อเปิดแชท
   useEffect(() => {
     if (activeChat) {
       activeChatIdRef.current = activeChat.id;
       fetchMessages(activeChat.id);
+
+      // เคลียร์สถานะ Unread ใน Database
+      api.put(`/chats/customers/${activeChat.id}/read`).then(() => {
+        // อัปเดต UI ให้เลข Unread หายไปทันที (Optimistic Update)
+        setChatList(prev => prev.map(c => c.id === activeChat.id ? { ...c, unread: 0 } : c));
+      }).catch(console.error);
+
+      // ประกาศบอกคนอื่นว่า "เราดูแชทนี้อยู่นะ"
+      if (stompClientRef.current?.connected) {
+        stompClientRef.current.publish({
+          destination: '/app/chat.presence',
+          body: JSON.stringify({ customerId: activeChat.id, adminName: currentAdminName })
+        });
+      }
+
     } else {
       setMessages([]);
     }
-  }, [activeChat?.id]);
+  }, [activeChat?.id, currentAdminName]); // ทำงานเมื่อเปลี่ยนห้องแชท
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: 'smooth' });
   }, [messages]);
 
+  // --- ตั้งค่า WebSocket ---
   useEffect(() => {
     const stompClient = new Client({
       webSocketFactory: () => new SockJS('http://localhost:8080/ws-chat'),
       reconnectDelay: 5000,
       onConnect: () => {
+        // ดักฟังข้อความแชทใหม่
         stompClient.subscribe('/topic/messages', (messageOutput) => {
           const newMessage = JSON.parse(messageOutput.body);
           const messageCustomerId = newMessage.customer?.id?.toString();
           
           if (messageCustomerId === activeChatIdRef.current) {
             setMessages((prev) => [...prev, newMessage]);
+            // ถ้ารับข้อความตอนเปิดแชทอยู่ ให้ยิงเคลียร์ Unread เลย
+            api.put(`/chats/customers/${messageCustomerId}/read`).catch(console.error);
           }
-          api.get('/chats/summary').then(res => {
-              const formattedChats = res.data.map((chat: any) => ({
-                ...chat,
-                tags: chat.tags || [],
-                time: chat.time ? new Date(chat.time).toLocaleTimeString('th-TH', { hour: '2-digit', minute: '2-digit' }) : ''
-              }));
-              setChatList(formattedChats);
-          });
+          // 🎯 แก้ตรงนี้: ให้รับ assignee ด้วย
+         // 💡 แก้ปัญหา Race Condition: หน่วงเวลา 300ms ให้ Backend (PostgreSQL) 
+          // บันทึก Assignee ลงตารางให้เสร็จ 100% ก่อน แล้วค่อยดึงข้อมูลอัปเดต
+          setTimeout(() => {
+            fetchInitialData();
+         }, 300);
+       });
+
+       // 💡 ซิงค์ข้อมูล Assignee ของห้องแชทปัจจุบัน ถ้ามีการเปลี่ยนแปลงจากภายนอก
+  useEffect(() => {
+    if (activeChat) {
+      const updatedChatDetails = chatList.find(c => c.id === activeChat.id);
+      // ถ้าพบว่าในรายการอัปเดตมีคนรับเคสไปแล้ว หรือมีการเปลี่ยนแปลง assignee
+      if (updatedChatDetails && updatedChatDetails.assignee !== activeChat.assignee) {
+        setActiveChat(updatedChatDetails);
+      }
+    }
+  }, [chatList]); // ทำงานทุกครั้งที่ chatList เปลี่ยนแปลง
+
+        // 💡 5. ดักฟังสถานะว่าแอดมินคนอื่นกำลังทำอะไรอยู่
+        stompClient.subscribe('/topic/presence', (messageOutput) => {
+          const presence: ViewingAdmin = JSON.parse(messageOutput.body);
+          // ถ้าเป็นชื่อแอดมินคนอื่น ให้บันทึกลง State
+          if (presence.adminName !== currentAdminName) {
+            setViewingAdmins(prev => {
+              const filtered = prev.filter(p => p.adminName !== presence.adminName);
+              return [...filtered, presence];
+            });
+            // เคลียร์สถานะออกอัตโนมัติหลัง 10 วินาที 
+            setTimeout(() => {
+              setViewingAdmins(prev => prev.filter(p => p.adminName !== presence.adminName));
+            }, 10000);
+          }
         });
       },
     });
 
     stompClient.activate();
+    stompClientRef.current = stompClient;
     return () => { stompClient.deactivate(); };
-  }, []);
+  }, [currentAdminName]);
 
   const fetchMessages = async (customerId: string) => {
     setIsLoading(true);
@@ -150,24 +218,53 @@ export default function Chat() {
   const handleSend = async () => {
     if (!messageInput.trim() || isSending || !activeChat) return;
     setIsSending(true);
+    
+    // 1. อัปเดต UI ให้แอดมินเห็นทันทีว่าตัวเองรับเคสแล้ว (ไม่ต้องรอโหลด)
+    if (!activeChat.assignee) {
+      setChatList(prev => prev.map(c => c.id === activeChat.id ? { ...c, assignee: currentAdminName } : c));
+      setActiveChat(prev => prev ? { ...prev, assignee: currentAdminName } : null);
+    }
+
     try {
-      await api.post(`/chats/${activeChat.id}/send`, { text: messageInput.trim() });
+      await api.post(`/chats/${activeChat.id}/send`, { 
+        text: messageInput.trim(),
+        senderName: currentAdminName 
+      });
       setMessageInput('');
+      
+      // ดึงข้อความใหม่มาแสดง
       await fetchMessages(activeChat.id);
+      
+      // ดึงข้อมูลรายชื่อแชทอัปเดตเพื่อให้แน่ใจว่า DB กับ UI ตรงกัน
+      fetchInitialData(); 
     } catch (err) {
       setError('ส่งข้อความไม่สำเร็จ');
+      // ถ้าส่งไม่สำเร็จ อาจจะต้องดึงข้อมูลเก่ากลับมา (Rollback UI)
+      fetchInitialData(); 
     } finally {
       setIsSending(false);
     }
   };
 
-  // --- 2. Filter Logic ---
+  const handleAssignChat = async (isAssigning: boolean) => {
+    if (!activeChat) return;
+    try {
+      const adminNameParam = isAssigning ? `?adminName=${encodeURIComponent(currentAdminName)}` : '';
+      await api.put(`/chats/customers/${activeChat.id}/assign${adminNameParam}`);
+      
+      // อัปเดต UI ทันที
+      setChatList(prev => prev.map(c => c.id === activeChat.id ? { ...c, assignee: isAssigning ? currentAdminName : null } : c));
+      setActiveChat(prev => prev ? { ...prev, assignee: isAssigning ? currentAdminName : null } : null);
+    } catch (err) {
+      console.error("Assign error", err);
+    }
+  };
+
   const filteredChats = useMemo(() => {
     return chatList.filter((chat) => {
       const isMatchName = chat.name.toLowerCase().includes(searchKeyword.toLowerCase());
       const isMatchTag = selectedTagId === '' || chat.tags.some(tag => tag.id === selectedTagId);
       const isMatchChannel = selectedChannelId === '' || chat.channelId === selectedChannelId;
-      
       return isMatchName && isMatchTag && isMatchChannel;
     });
   }, [chatList, searchKeyword, selectedTagId, selectedChannelId]);
@@ -178,7 +275,6 @@ export default function Chat() {
       {/* ================= ฝั่งซ้าย: รายชื่อแชท ================= */}
       <div className="w-[380px] flex flex-col bg-white border-r border-gray-200 shadow-sm z-20">
         
-        {/* Header แถบซ้าย */}
         <div className="px-5 py-4 bg-white flex items-center justify-between border-b border-gray-100">
           <div className="flex items-center gap-3">
             <Link to="/" className="p-2 text-gray-400 hover:text-amber-600 hover:bg-amber-50 rounded-full transition-all">
@@ -188,7 +284,6 @@ export default function Chat() {
           </div>
         </div>
 
-        {/* โซน Search & Filter */}
         <div className="px-5 py-4 bg-white border-b border-gray-100 space-y-3">
           <div className="relative group">
             <Search className="absolute left-3.5 top-2.5 text-gray-400 group-focus-within:text-amber-500 transition-colors" size={18} />
@@ -232,57 +327,78 @@ export default function Chat() {
           </div>
         </div>
 
-        {/* รายชื่อแชท */}
         <div className="flex-1 overflow-y-auto [&::-webkit-scrollbar]:w-1.5 [&::-webkit-scrollbar-thumb]:bg-gray-200 hover:[&::-webkit-scrollbar-thumb]:bg-gray-300 [&::-webkit-scrollbar-thumb]:rounded-full">
-          {filteredChats.map((chat) => (
-            <div
-              key={chat.id}
-              onClick={() => setActiveChat(chat)}
-              className={`p-4 cursor-pointer transition-all border-b border-gray-50 ${
-                activeChat?.id === chat.id 
-                  ? 'bg-amber-50/50 border-l-4 border-l-amber-500 shadow-sm relative' 
-                  : 'hover:bg-gray-50 border-l-4 border-l-transparent bg-white'
-              }`}
-            >
-              <div className="flex justify-between items-start mb-1.5">
-                <h3 className={`text-sm truncate pr-2 ${activeChat?.id === chat.id ? 'font-bold text-gray-900' : 'font-semibold text-gray-700'}`}>
-                  {chat.name}
-                </h3>
-                <span className={`text-[11px] font-medium shrink-0 ${chat.unread > 0 ? 'text-amber-600' : 'text-gray-400'}`}>
-                  {chat.time}
-                </span>
-              </div>
-              
-              <p className={`text-sm truncate mb-2.5 ${chat.unread > 0 ? 'font-semibold text-gray-800' : 'text-gray-500'}`}>
-                {chat.lastMessage}
-              </p>
-              
-              <div className="flex flex-wrap items-center justify-between gap-2">
-                <div className="flex flex-wrap items-center gap-1.5">
-                  <span 
-                    className="text-[10px] px-1.5 py-0.5 rounded-md flex items-center gap-1 font-medium bg-gray-50 border border-gray-200 text-gray-600"
-                  >
-                    <Store size={10} /> {chat.channel || 'ไม่ระบุ'}
-                  </span>
+          {filteredChats.map((chat) => {
+            // 💡 เช็กว่ามีแอดมินคนอื่นดูแชทนี้อยู่ไหม
+            const otherAdminViewing = viewingAdmins.find(v => v.customerId === chat.id);
 
-                  {chat.tags.slice(0, 2).map(tag => (
-                    <span 
-                      key={tag.id} className="text-[10px] px-1.5 py-0.5 rounded-md truncate max-w-[80px] font-medium border"
-                      style={{ backgroundColor: `${tag.color}15`, color: tag.color, borderColor: `${tag.color}30` }}
-                    >
-                      {tag.name}
-                    </span>
-                  ))}
+            return (
+              <div
+                key={chat.id}
+                onClick={() => setActiveChat(chat)}
+                className={`p-4 cursor-pointer transition-all border-b border-gray-50 ${
+                  activeChat?.id === chat.id 
+                    ? 'bg-amber-50/50 border-l-4 border-l-amber-500 shadow-sm relative' 
+                    : 'hover:bg-gray-50 border-l-4 border-l-transparent bg-white'
+                }`}
+              >
+                <div className="flex justify-between items-start mb-1.5">
+                  <h3 className={`text-sm truncate pr-2 ${activeChat?.id === chat.id ? 'font-bold text-gray-900' : 'font-semibold text-gray-700'}`}>
+                    {chat.name}
+                  </h3>
+                  <span className={`text-[11px] font-medium shrink-0 ${chat.unread > 0 ? 'text-amber-600' : 'text-gray-400'}`}>
+                    {chat.time}
+                  </span>
                 </div>
+                
+                <p className={`text-sm truncate mb-2.5 ${chat.unread > 0 ? 'font-semibold text-gray-800' : 'text-gray-500'}`}>
+                  {chat.lastMessage}
+                </p>
+                
+                <div className="flex flex-wrap items-center justify-between gap-2">
+                  <div className="flex flex-wrap items-center gap-1.5">
+                    <span 
+                      className="text-[10px] px-1.5 py-0.5 rounded-md flex items-center gap-1 font-medium bg-gray-50 border border-gray-200 text-gray-600"
+                    >
+                      <Store size={10} /> {chat.channel || 'ไม่ระบุ'}
+                    </span>
+                    {/* 🎯 จุดที่เพิ่ม: ป้ายสถานะคนดูแล! */}
+                    {chat.assignee ? (
+                      <span className="text-[10px] bg-blue-50 text-blue-700 border border-blue-200 px-1.5 py-0.5 rounded-md flex items-center gap-1 font-bold">
+                        <User size={10} /> ดูแลโดย: {chat.assignee}
+                      </span>
+                    ) : (
+                      <span className="text-[10px] bg-green-50 text-green-700 border border-green-200 px-1.5 py-0.5 rounded-md flex items-center gap-1 font-bold">
+                        รอแอดมินตอบ...
+                      </span>
+                    )}
 
-                {chat.unread > 0 && (
-                  <span className="bg-gradient-to-r from-red-500 to-rose-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full shrink-0 shadow-sm">
-                    {chat.unread}
-                  </span>
-                )}
+                    {chat.tags.slice(0, 2).map(tag => (
+                      <span 
+                        key={tag.id} className="text-[10px] px-1.5 py-0.5 rounded-md truncate max-w-[80px] font-medium border"
+                        style={{ backgroundColor: `${tag.color}15`, color: tag.color, borderColor: `${tag.color}30` }}
+                      >
+                        {tag.name}
+                      </span>
+                    ))}
+
+                    {/* 💡 แจ้งเตือนแอดมินตอบชน ในแถบด้านซ้าย */}
+                    {otherAdminViewing && (
+                      <span className="flex items-center gap-1 text-[10px] bg-blue-50 text-blue-600 border border-blue-200 px-1.5 py-0.5 rounded-md font-bold animate-pulse">
+                        <Eye size={10} /> {otherAdminViewing.adminName}
+                      </span>
+                    )}
+                  </div>
+
+                  {chat.unread > 0 && (
+                    <span className="bg-gradient-to-r from-red-500 to-rose-500 text-white text-[10px] font-bold px-2 py-0.5 rounded-full shrink-0 shadow-sm">
+                      {chat.unread}
+                    </span>
+                  )}
+                </div>
               </div>
-            </div>
-          ))}
+            );
+          })}
           {filteredChats.length === 0 && (
             <div className="flex flex-col items-center justify-center h-40 text-gray-400">
               <MessageSquare size={32} className="mb-2 opacity-50" />
@@ -294,7 +410,6 @@ export default function Chat() {
 
       {/* ================= ฝั่งขวา: ห้องแชท ================= */}
       <div className="flex-1 flex flex-col relative bg-[#F9FAFB]">
-        {/* ลายพื้นหลังแบบมินิมอล (ตาข่ายจางๆ) เพื่อให้อ่านง่าย ไม่ปวดตา */}
         <div className="absolute inset-0 opacity-[0.03] pointer-events-none" style={{ backgroundImage: 'radial-gradient(#000 1px, transparent 1px)', backgroundSize: '20px 20px' }}></div>
 
         {!activeChat ? (
@@ -311,7 +426,6 @@ export default function Chat() {
             {/* Header ห้องแชท */}
             <div className="h-20 bg-white/90 backdrop-blur-md border-b border-gray-200 px-6 flex items-center justify-between shadow-sm sticky top-0 z-20">
               <div className="flex items-center gap-4">
-                {/* รูปโปรไฟล์ Default แบบหรูหรา */}
                 <div className="w-12 h-12 bg-gradient-to-br from-amber-400 to-yellow-500 rounded-full flex items-center justify-center shadow-md shadow-amber-200 text-white font-bold text-lg border-2 border-white">
                   {activeChat.name.charAt(0)}
                 </div>
@@ -332,6 +446,33 @@ export default function Chat() {
                   </p>
                 </div>
               </div>
+              {/* 🎯 2. เปลี่ยนปุ่มสีเขียว เป็นป้ายบอกสถานะเฉยๆ */}
+              <div className="flex items-center gap-3">
+                {!activeChat.assignee ? (
+                  <span className="text-sm font-bold text-green-600 bg-green-50 px-3 py-1.5 rounded-lg border border-green-200 flex items-center gap-2">
+                    พิมพ์ตอบเพื่อรับเคสนี้อัตโนมัติ
+                  </span>
+                ) : (
+                  <div className="flex items-center gap-2">
+                    <span className="text-sm font-bold text-gray-600 bg-gray-100 px-3 py-1.5 rounded-lg border border-gray-200 flex items-center gap-2">
+                      <User size={16} className="text-amber-500" /> 
+                      ดูแลโดย: {activeChat.assignee}
+                    </span>
+                  </div>
+                )}
+              </div>
+
+              {/* 💡 แจ้งเตือนมุมขวาบน ถ้ามีแอดมินคนอื่นเปิดแชทนี้ค้างไว้ */}
+              {viewingAdmins.find(v => v.customerId === activeChat.id) && (
+                <div className="flex items-center gap-2 bg-blue-50 border border-blue-100 px-3 py-1.5 rounded-full animate-pulse shadow-sm">
+                   <div className="w-6 h-6 bg-blue-500 rounded-full text-white flex items-center justify-center text-xs font-bold">
+                     {viewingAdmins.find(v => v.customerId === activeChat.id)?.adminName.charAt(0).toUpperCase()}
+                   </div>
+                   <span className="text-xs font-bold text-blue-700">
+                     กำลังดูแชทนี้...
+                   </span>
+                </div>
+              )}
             </div>
 
             {/* พื้นที่ข้อความ */}
@@ -342,9 +483,8 @@ export default function Chat() {
                 </div>
               )}
               
-              {!isLoading && messages.map((msg, index) => {
+              {!isLoading && messages.map((msg) => {
                 const isAdmin = msg.senderType === 'AGENT' || msg.senderType === 'ADMIN';
-                // ตัดสินใจโชว์เวลาเฉพาะข้อความที่ห่างกันเพื่อความสะอาดตา (Optional)
                 return (
                   <div key={msg.id} className={`flex ${isAdmin ? 'justify-end' : 'justify-start'} group animate-in fade-in slide-in-from-bottom-2 duration-300`}>
                     
@@ -354,13 +494,19 @@ export default function Chat() {
                        </div>
                     )}
 
-                    <div className={`max-w-[65%] flex flex-col ${isAdmin ? 'items-end' : 'items-start'}`}>
+<div className={`max-w-[65%] flex flex-col ${isAdmin ? 'items-end' : 'items-start'}`}>
+                      
+                      {/* 🎯 เพิ่มส่วนนี้: โชว์ชื่อแอดมินเหนือกล่องข้อความ */}
+                      {isAdmin && msg.senderName && (
+                        <span className="text-[11px] font-medium text-gray-400 mb-1 mr-1">
+                          ตอบโดย: <span className="text-gray-600 font-bold">{msg.senderName}</span>
+                        </span>
+                      )}
+
                       <div 
                         className={`px-5 py-3 shadow-sm text-[15px] leading-relaxed ${
                           isAdmin 
-                            // 💡 สีของ Admin: เหลืองอำพัน ตัวหนังสือเทาเข้ม (อ่านง่ายสุดๆ)
                             ? 'bg-gradient-to-br from-amber-400 to-amber-500 text-gray-900 rounded-[20px] rounded-br-sm shadow-amber-500/20' 
-                            // 💡 สีของ Customer: ขาวล้วน ขอบเทาอ่อน
                             : 'bg-white text-gray-800 rounded-[20px] rounded-bl-sm border border-gray-100 shadow-gray-200/50'
                         }`}
                       >
@@ -371,7 +517,11 @@ export default function Chat() {
                         <span className="text-[11px] font-medium text-gray-400">
                           {formatTime(msg.createdAt)}
                         </span>
-                        {isAdmin && <CheckCircle2 size={12} className="text-amber-500" />}
+                        {isAdmin && (
+                          <span title="ส่งแล้ว" className="flex items-center">
+                            <CheckCircle2 size={12} className="text-amber-500" />
+                          </span>
+                        )}
                       </div>
                     </div>
                   </div>
